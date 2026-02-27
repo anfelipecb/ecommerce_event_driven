@@ -1,92 +1,176 @@
 # Event-Driven Order Processing
 
-A live demo of an event-driven microservices architecture using **Redis Streams**, **FastAPI**, and **React**.
+Order processing system built on an event-driven microservices architecture. Three independent services -- Inventory, Payment, and Shipment -- communicate through **Redis Streams** instead of calling each other directly. A React frontend shows the event chain in real time.
+
+## Why Event-Driven for E-Commerce?
+
+In a traditional (synchronous) order processing system, the gateway would call Inventory, wait for a response, then call Payment, wait again, then call Shipment. Every service is chained through direct HTTP calls. If Shipment is slow or down, the entire order request hangs or fails -- one broken link kills the whole chain.
+
+With event-driven architecture, the gateway publishes the order to a stream and immediately responds to the user. Each service picks up work at its own pace from the message broker. This matters in e-commerce because:
+
+- **Spikes are absorbed, not rejected.** During a flash sale, thousands of orders hit the gateway. Instead of overwhelming downstream services with synchronous calls, orders queue up in Redis Streams and services consume them as fast as they can. No dropped requests, no timeouts.
+- **Failures are isolated.** If the Shipment service crashes, orders still get placed and paid. The shipment events wait in Redis until the service recovers. In a synchronous system, the entire checkout would fail.
+- **Services scale independently.** Payment processing is slower than inventory checks. With events, you can run 3 Payment containers and 1 Inventory container -- each scales based on its own bottleneck, not the bottleneck of the slowest service in the chain.
+
+### How This Improves CI/CD
+
+The event-driven approach directly benefits the deployment pipeline:
+
+- **Independent deployments.** Each microservice has its own Dockerfile, its own codebase, its own container. You can deploy a new version of Payment without touching Inventory or Shipment. In a monolith or tightly coupled system, changing one piece risks breaking everything.
+- **Zero-downtime deploys.** When you redeploy the Shipment service, its container goes down briefly. During that window, events accumulate in Redis instead of failing. When the new container starts, it picks up where the old one left off. The deploy is invisible to the user.
+- **Smaller blast radius.** A bad deploy to one service doesn't cascade. If a buggy Inventory release starts rejecting events, Payment and Shipment keep running fine on their existing workload. You roll back one container, not the whole system.
+- **Faster pipelines.** Three small services mean three small Docker images, three fast test suites, three independent CI pipelines. A change to shipment logic doesn't trigger inventory tests.
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    subgraph client [Client]
+        UI["React UI"]
+    end
+
+    subgraph infra [Infrastructure]
+        GW["FastAPI Gateway"]
+        Redis["Redis Streams"]
+    end
+
+    subgraph micro [Microservices]
+        Inv["Inventory"]
+        Pay["Payment"]
+        Ship["Shipment"]
+    end
+
+    UI -->|"POST /orders"| GW
+    UI -.->|"SSE /events"| GW
+    GW -->|"XADD orders"| Redis
+    Redis -->|"XREADGROUP"| Inv
+    Inv -->|"inventory.reserved"| Redis
+    Redis -->|"XREADGROUP"| Pay
+    Pay -->|"payment.processed"| Redis
+    Redis -->|"XREADGROUP"| Ship
+    Ship -->|"shipment.created"| Redis
+    GW -.->|"XREAD events"| Redis
 ```
-┌─────────────┐      ┌───────────────┐      ┌─────────────────┐
-│  React UI   │─────▶│ FastAPI       │─────▶│ Redis Streams   │
-│  (Vite)     │◀─SSE─│ Gateway       │      │ (orders/events) │
-└─────────────┘      └───────────────┘      └────────┬────────┘
-                                                     │
-                                   ┌─────────────────┼─────────────────┐
-                                   ▼                 ▼                 ▼
-                           ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-                           │  Inventory   │  │   Payment    │  │  Shipment    │
-                           │  Service     │──▶  Service     │──▶  Service     │
-                           └──────────────┘  └──────────────┘  └──────────────┘
-```
 
-### Event Flow
+### Components
 
-1. User submits an order via the React UI
-2. Gateway publishes the order to the `orders` Redis Stream
-3. **Inventory Service** consumes the order, reserves stock, publishes `inventory.reserved`
-4. **Payment Service** picks up that event, processes payment, publishes `payment.processed`
-5. **Shipment Service** picks up that event, creates a shipment, publishes `shipment.created`
-6. The React UI receives all events in real time via SSE (Server-Sent Events)
+| Component | Role | Microservice? |
+|---|---|---|
+| **Inventory Service** | Reserves product stock for an order | Yes |
+| **Payment Service** | Processes payment | Yes |
+| **Shipment Service** | Creates shipping label and tracking number | Yes |
+| **FastAPI Gateway** | Entry point -- publishes orders to Redis, streams events to the UI via SSE | No (API Gateway) |
+| **React Frontend** | Order form + live event feed | No (Client) |
+| **Redis** | Message broker with Streams and consumer groups | No (Infrastructure) |
 
-## Tech Stack
+### Event Chain
 
-| Component     | Technology              |
-|---------------|-------------------------|
-| Frontend      | React + TypeScript (Vite) |
-| Gateway       | Python FastAPI          |
-| Broker        | Redis Streams           |
-| Microservices | Python (redis-py)       |
-| Orchestration | Docker Compose          |
+1. Gateway receives an order and publishes it to the `orders` stream
+2. Inventory reads from `orders`, reserves stock, publishes `inventory.reserved` to the `events` stream
+3. Payment reads `inventory.reserved`, processes the charge, publishes `payment.processed`
+4. Shipment reads `payment.processed`, assigns a carrier and tracking number, publishes `shipment.created`
+5. The frontend receives every event in real time through SSE
 
-## Quick Start
+Each service uses `XREADGROUP` (Redis consumer groups), which means messages are durable -- if a service goes down, pending messages wait in the stream until it comes back.
 
-### Prerequisites
+## Prerequisites
 
-- Docker and Docker Compose installed
+[Docker](https://docs.docker.com/get-docker/) and Docker Compose.
 
-### Run
+## Seeing It in Action
+
+### Starting the system
 
 ```bash
 docker-compose up --build
 ```
 
-Then open [http://localhost:3000](http://localhost:3000) in your browser.
+This brings up 6 containers: Redis, Gateway, Inventory, Payment, Shipment, and Frontend. The services wait for Redis to pass its health check before starting.
 
-### Stop
+### Submitting an order
+
+We open http://localhost:3000, add a couple of products to the cart, and submit. On the right panel we can see events appearing in real time as they flow through the chain:
+
+- `order.created` -- the gateway accepted the order
+- `inventory.reserved` -- stock was reserved
+- `payment.processed` -- the charge went through
+- `shipment.created` -- a tracking number was assigned
+
+We can submit a second order to see the chain run again independently.
+
+### Checking the logs
 
 ```bash
-docker-compose down
+docker-compose logs -f
+```
+
+Here we can see each service logging what it's doing in its own output. They're separate processes in separate containers -- the only thing they share is the Redis connection. We can also filter to a single service:
+
+```bash
+docker-compose logs -f payment
+```
+
+### Testing resilience
+
+This is where it gets interesting. We stop the Shipment service while the system is running:
+
+```bash
+docker-compose stop shipment
+```
+
+Now we submit a new order. The UI shows events up to `payment.processed` but no `shipment.created` -- the event is sitting in Redis, waiting for a consumer that isn't there.
+
+We bring it back:
+
+```bash
+docker-compose start shipment
+```
+
+The `shipment.created` event appears in the UI. The service picked up the pending message automatically. No messages were lost -- this is Redis Streams with consumer groups retaining unacknowledged messages until a consumer comes back to process them.
+
+### Inspecting Redis directly
+
+We can look at the raw events stored in the stream:
+
+```bash
+docker exec -it eventbased-redis-1 redis-cli XRANGE events - +
+```
+
+Every event is persisted with all its fields. We can also check what messages are pending in a consumer group:
+
+```bash
+docker exec -it eventbased-redis-1 redis-cli XPENDING events shipment-group - + 10
 ```
 
 ## Project Structure
 
 ```
 EventBased/
-├── docker-compose.yml          # Orchestrates all services
-├── gateway/
-│   └── main.py                 # FastAPI: POST /orders + SSE /events
+├── docker-compose.yml
+├── gateway/                    # API Gateway
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── main.py                 # POST /orders, GET /events (SSE)
 ├── services/
-│   ├── inventory/main.py       # Consumes orders → publishes inventory.reserved
-│   ├── payment/main.py         # Consumes inventory.reserved → publishes payment.processed
-│   └── shipment/main.py        # Consumes payment.processed → publishes shipment.created
+│   ├── inventory/
+│   │   └── main.py             # orders -> inventory.reserved
+│   ├── payment/
+│   │   └── main.py             # inventory.reserved -> payment.processed
+│   └── shipment/
+│       └── main.py             # payment.processed -> shipment.created
 └── frontend/
-    └── src/App.tsx             # React UI with order form + live event feed
+    ├── Dockerfile
+    ├── package.json
+    └── src/
+        └── App.tsx             # Order form + live event timeline
 ```
 
-## Demo Script
+## Tech Stack
 
-1. **Show the architecture** - explain the event flow and Redis Streams
-2. **Start everything** - `docker-compose up --build`
-3. **Submit an order** - open the UI, add products, submit
-4. **Watch events flow** - see the timeline update in real time
-5. **View logs** - `docker-compose logs -f` to see each service processing
-6. **Kill a service** - `docker-compose stop shipment`, submit another order, show it stalls
-7. **Bring it back** - `docker-compose start shipment`, watch it pick up the pending event
-8. **Inspect Redis** - `docker exec -it eventbased-redis-1 redis-cli XRANGE events - +`
-
-## Key Concepts Demonstrated
-
-- **Event-driven architecture**: Services communicate through events, not direct calls
-- **Redis Streams**: Durable message queue with consumer groups for reliable delivery
-- **Loose coupling**: Each service only knows about the events it consumes and produces
-- **Resilience**: Services can go down and recover without losing messages
-- **Real-time visibility**: SSE provides live updates to the frontend
+| | Technology |
+|---|---|
+| Frontend | React, TypeScript, Vite |
+| Gateway | Python, FastAPI, SSE |
+| Broker | Redis Streams |
+| Services | Python, redis-py |
+| Orchestration | Docker Compose |
