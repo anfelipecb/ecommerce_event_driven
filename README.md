@@ -1,16 +1,16 @@
 # Event-Driven Order Processing
 
-Order processing system built on an event-driven microservices architecture. Three independent services -- Inventory, Payment, and Shipment -- communicate through **Redis Streams** instead of calling each other directly. A React frontend shows the event chain in real time.
+Order processing system built on an event-driven microservices architecture. Three independent services (Inventory, Payment, and Shipment) communicate through **Redis Streams** instead of calling each other directly. A React frontend shows the event chain in real time.
 
 ## Why Event-Driven for E-Commerce?
 
-In a traditional (synchronous) order processing system, the gateway would call Inventory, wait for a response, then call Payment, wait again, then call Shipment. Every service is chained through direct HTTP calls. If Shipment is slow or down, the entire order request hangs or fails -- one broken link kills the whole chain.
+In a traditional (synchronous) order processing system, the gateway would call Inventory, wait for a response, then call Payment, wait again, then call Shipment. Every service is chained through direct HTTP calls. If Shipment is slow or down, the entire order request hangs or fails because one broken link kills the whole chain.
 
 With event-driven architecture, the gateway publishes the order to a stream and immediately responds to the user. Each service picks up work at its own pace from the message broker. This matters in e-commerce because:
 
 - **Spikes are absorbed, not rejected.** During a flash sale, thousands of orders hit the gateway. Instead of overwhelming downstream services with synchronous calls, orders queue up in Redis Streams and services consume them as fast as they can. No dropped requests, no timeouts.
 - **Failures are isolated.** If the Shipment service crashes, orders still get placed and paid. The shipment events wait in Redis until the service recovers. In a synchronous system, the entire checkout would fail.
-- **Services scale independently.** Payment processing is slower than inventory checks. With events, you can run 3 Payment containers and 1 Inventory container -- each scales based on its own bottleneck, not the bottleneck of the slowest service in the chain.
+- **Services scale independently.** Payment processing is slower than inventory checks. With events, you can run 3 Payment containers and 1 Inventory container so each scales based on its own bottleneck, not the bottleneck of the slowest service in the chain.
 
 ### How This Improves CI/CD
 
@@ -59,7 +59,7 @@ flowchart LR
 | **Inventory Service** | Reserves product stock for an order | Yes |
 | **Payment Service** | Processes payment | Yes |
 | **Shipment Service** | Creates shipping label and tracking number | Yes |
-| **FastAPI Gateway** | Entry point -- publishes orders to Redis, streams events to the UI via SSE | No (API Gateway) |
+| **FastAPI Gateway** | Entry point that publishes orders to Redis and streams events to the UI via SSE | No (API Gateway) |
 | **React Frontend** | Order form + live event feed | No (Client) |
 | **Redis** | Message broker with Streams and consumer groups | No (Infrastructure) |
 
@@ -71,7 +71,7 @@ flowchart LR
 4. Shipment reads `payment.processed`, assigns a carrier and tracking number, publishes `shipment.created`
 5. The frontend receives every event in real time through SSE
 
-Each service uses `XREADGROUP` (Redis consumer groups), which means messages are durable -- if a service goes down, pending messages wait in the stream until it comes back.
+Each service uses `XREADGROUP` (Redis consumer groups), which means messages are durable. If a service goes down, pending messages wait in the stream until it comes back.
 
 ## Prerequisites
 
@@ -91,10 +91,10 @@ This brings up 6 containers: Redis, Gateway, Inventory, Payment, Shipment, and F
 
 We open http://localhost:3000, add a couple of products to the cart, and submit. On the right panel we can see events appearing in real time as they flow through the chain:
 
-- `order.created` -- the gateway accepted the order
-- `inventory.reserved` -- stock was reserved
-- `payment.processed` -- the charge went through
-- `shipment.created` -- a tracking number was assigned
+- `order.created`: the gateway accepted the order
+- `inventory.reserved`: stock was reserved
+- `payment.processed`: the charge went through
+- `shipment.created`: a tracking number was assigned
 
 We can submit a second order to see the chain run again independently.
 
@@ -104,7 +104,7 @@ We can submit a second order to see the chain run again independently.
 docker-compose logs -f
 ```
 
-Here we can see each service logging what it's doing in its own output. They're separate processes in separate containers -- the only thing they share is the Redis connection. We can also filter to a single service:
+Here we can see each service logging what it's doing in its own output. They're separate processes in separate containers, and the only thing they share is the Redis connection. We can also filter to a single service:
 
 ```bash
 docker-compose logs -f payment
@@ -118,7 +118,7 @@ This is where it gets interesting. We stop the Shipment service while the system
 docker-compose stop shipment
 ```
 
-Now we submit a new order. The UI shows events up to `payment.processed` but no `shipment.created` -- the event is sitting in Redis, waiting for a consumer that isn't there.
+Now we submit a new order. The UI shows events up to `payment.processed` but no `shipment.created` because the event is sitting in Redis, waiting for a consumer that isn't there.
 
 We bring it back:
 
@@ -126,7 +126,7 @@ We bring it back:
 docker-compose start shipment
 ```
 
-The `shipment.created` event appears in the UI. The service picked up the pending message automatically. No messages were lost -- this is Redis Streams with consumer groups retaining unacknowledged messages until a consumer comes back to process them.
+The `shipment.created` event appears in the UI. The service picked up the pending message automatically. No messages were lost. Redis Streams with consumer groups retains unacknowledged messages until a consumer comes back to process them.
 
 ### Inspecting Redis directly
 
